@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlparse, urlunparse
+import xml.etree.ElementTree as ET
 
 
 DEFAULT_USER_AGENT = (
@@ -29,10 +31,35 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Check Theoretical Staging Links from a CSV and update 'Page Exists?'"
     )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # generate mode
+    gen = subparsers.add_parser(
+        "generate",
+        help="Generate a CSV from a site's sitemap with staging URLs",
+    )
+    gen.add_argument("site", help="Site root or sitemap.xml URL (e.g., https://www.example.com)")
+    gen.add_argument(
+        "--staging-base",
+        required=True,
+        help="Staging base host (e.g., staging-fringe.webflow.io). 'https://' is auto-added.",
+    )
+    gen.add_argument(
+        "-o",
+        "--output",
+        help="Output CSV path. Defaults to 'sitemap-checked-<timestamp>.csv' in CWD.",
+    )
+    gen.add_argument(
+        "--no-precheck",
+        action="store_true",
+        help="Skip HTTP checks during generation (by default we pre-check live & staging)",
+    )
+
+    # check/update mode (default)
     parser.add_argument(
         "-i",
         "--input",
-        required=True,
+        required=False,
         help="Path to input CSV (e.g. 'FRI - Full Sitemap - Redirect Planning.csv')",
     )
     parser.add_argument(
@@ -84,9 +111,11 @@ def decide_page_exists_value(
     status_code: Optional[int],
     scope_value: str,
     status_value: str,
+    url_matches_value: str = "",
 ) -> str:
     scope_normalized = (scope_value or "").strip().lower()
     status_normalized = (status_value or "").strip().lower()
+    url_matches_normalized = (url_matches_value or "").strip().lower()
 
     is_in_scope = any(
         token in scope_normalized for token in ("in scope",)
@@ -105,6 +134,9 @@ def decide_page_exists_value(
         return "Yes"
 
     if status_code == 404:
+        # If URL Matches is 'Yes', we prefer 'No' rather than '404' to avoid noise
+        if url_matches_normalized in ("yes", "y", "true"):  # treat as a structural match
+            return "No"
         return "No" if not_needed else ("404" if is_in_scope else "No")
 
     return "No"
@@ -139,6 +171,134 @@ def compute_output_path(input_path: str, override_output: Optional[str]) -> str:
     return os.path.join(parent, f"{name}-checked-{timestamp}{ext or '.csv'}")
 
 
+def ensure_https(url: str) -> str:
+    if not url:
+        return url
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        return f"https://{url}"
+    return url
+
+
+def build_staging_url(live_url: str, staging_base_host: str) -> str:
+    staging_base_host = staging_base_host.strip().rstrip("/")
+    live_url = ensure_https(live_url)
+    parsed = urlparse(live_url)
+    path = parsed.path or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"https://{staging_base_host}{path}{query}"
+
+
+def parse_sitemap_content(xml_bytes: bytes) -> List[str]:
+    urls: List[str] = []
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return urls
+    tag = root.tag.lower()
+    if tag.endswith("sitemapindex"):
+        for sm in root.findall("{*}sitemap"):
+            loc_el = sm.find("{*}loc")
+            if loc_el is not None and loc_el.text:
+                try:
+                    with urlopen(ensure_https(loc_el.text), timeout=15) as resp:
+                        urls.extend(parse_sitemap_content(resp.read()))
+                except Exception:
+                    continue
+    elif tag.endswith("urlset"):
+        for u in root.findall("{*}url"):
+            loc_el = u.find("{*}loc")
+            if loc_el is not None and loc_el.text:
+                urls.append(loc_el.text.strip())
+    return urls
+
+
+def fetch_sitemap_urls(site_or_sitemap: str) -> List[str]:
+    base = ensure_https(site_or_sitemap.strip())
+    try_urls = [base]
+    if not base.lower().endswith(".xml"):
+        # Try common sitemap location
+        base_no_slash = base.rstrip("/")
+        try_urls = [f"{base_no_slash}/sitemap.xml"]
+    urls: List[str] = []
+    for candidate in try_urls:
+        try:
+            with urlopen(candidate, timeout=15) as resp:
+                content = resp.read()
+            urls = parse_sitemap_content(content)
+            if urls:
+                break
+        except Exception:
+            continue
+    return sorted(set(urls))
+
+
+def is_ok(status_code: Optional[int]) -> bool:
+    return status_code is not None and 200 <= status_code < 400
+
+
+def generate_rows_from_sitemap(
+    site_or_sitemap: str,
+    staging_base_host: str,
+    precheck: bool = True,
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    live_urls = fetch_sitemap_urls(site_or_sitemap)
+    fieldnames = [
+        "Live Site URL",
+        "Theoretical Staging Link",
+        "Page Exists?",
+        "URL Matches",
+        "Redirect URL",
+        "Scope",
+        "Status",
+    ]
+    rows: List[Dict[str, str]] = []
+    if not live_urls:
+        return rows, fieldnames
+
+    # Precompute staging URLs
+    staging_urls = [build_staging_url(live, staging_base_host) for live in live_urls]
+
+    live_status: List[Optional[int]] = [None] * len(live_urls)
+    staging_status: List[Optional[int]] = [None] * len(staging_urls)
+
+    if precheck:
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            futures = {}
+            for i, u in enumerate(live_urls):
+                futures[executor.submit(fetch_status, ensure_https(u), 10.0, DEFAULT_USER_AGENT)] = ("live", i)
+            for i, u in enumerate(staging_urls):
+                futures[executor.submit(fetch_status, ensure_https(u), 10.0, DEFAULT_USER_AGENT)] = ("staging", i)
+            for fut in as_completed(futures):
+                kind, idx = futures[fut]
+                try:
+                    res = fut.result()
+                    code = res.status_code
+                except Exception:
+                    code = None
+                if kind == "live":
+                    live_status[idx] = code
+                else:
+                    staging_status[idx] = code
+
+    for i, live in enumerate(live_urls):
+        staging = staging_urls[i]
+        page_exists = "Yes" if is_ok(staging_status[i]) else "No"
+        url_matches = "Yes" if (is_ok(live_status[i]) and is_ok(staging_status[i])) else "Page Does Not Exist"
+        rows.append(
+            {
+                "Live Site URL": live,
+                "Theoretical Staging Link": staging,
+                "Page Exists?": page_exists,
+                "URL Matches": url_matches,
+                "Redirect URL": "",
+                "Scope": "",
+                "Status": "",
+            }
+        )
+    return rows, fieldnames
+
+
 def read_csv_rows(input_path: str) -> Tuple[List[Dict[str, str]], List[str]]:
     with open(input_path, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -158,6 +318,29 @@ def write_csv_rows(output_path: str, fieldnames: List[str], rows: List[Dict[str,
 def main() -> int:
     args = parse_args()
 
+    # Generation mode
+    if args.command == "generate":
+        rows, fieldnames = generate_rows_from_sitemap(
+            site_or_sitemap=args.site,
+            staging_base_host=args.staging_base,
+            precheck=(not args.no_precheck),
+        )
+        if not rows:
+            print("No URLs found in sitemap", file=sys.stderr)
+            return 2
+        # Output path
+        out = args.output
+        if not out:
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            out = os.path.abspath(f"sitemap-checked-{timestamp}.csv")
+        try:
+            write_csv_rows(out, fieldnames, rows)
+        except Exception as e:
+            print(f"Failed to write generated CSV: {e}", file=sys.stderr)
+            return 3
+        print(f"Generated CSV: {out} (rows={len(rows)})")
+        return 0
+
     input_path = args.input
     output_path = compute_output_path(input_path, args.output)
     timeout = float(args.timeout)
@@ -173,18 +356,10 @@ def main() -> int:
         print(f"Input file not found: {input_path}", file=sys.stderr)
         return 2
 
-    required_columns = {
-        "Theoretical Staging Link",
-        "Page Exists?",
-        "Scope",
-        "Status",
-    }
-    missing = [c for c in required_columns if c not in (fieldnames or [])]
+    required_columns_min = {"Theoretical Staging Link", "Page Exists?"}
+    missing = [c for c in required_columns_min if c not in (fieldnames or [])]
     if missing:
-        print(
-            "Missing required column(s) in CSV: " + ", ".join(missing),
-            file=sys.stderr,
-        )
+        print("Missing required column(s) in CSV: " + ", ".join(missing), file=sys.stderr)
         return 2
 
     urls_to_check: List[Tuple[int, str]] = []
@@ -229,10 +404,13 @@ def main() -> int:
     for idx, row in enumerate(rows):
         scope_value = row.get("Scope", "")
         status_value = row.get("Status", "")
+        url_matches_value = row.get("URL Matches", "")
         crawl_result = index_to_result.get(idx)
         status_code = crawl_result.status_code if crawl_result else None
 
-        page_exists_value = decide_page_exists_value(status_code, scope_value, status_value)
+        page_exists_value = decide_page_exists_value(
+            status_code, scope_value, status_value, url_matches_value
+        )
         row["Page Exists?"] = page_exists_value
         pasteable_values.append(page_exists_value)
         if verbose:

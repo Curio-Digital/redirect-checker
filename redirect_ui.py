@@ -65,9 +65,10 @@ def run_checks(rows: List[Dict[str, str]], concurrency: int, timeout: float, use
     for idx, row in enumerate(rows):
         scope_value = row.get("Scope", "")
         status_value = row.get("Status", "")
+        url_matches_value = row.get("URL Matches", "")
         crawl_result = index_to_result.get(idx)
         status_code = crawl_result.status_code if crawl_result else None
-        value = redirect_mod.decide_page_exists_value(status_code, scope_value, status_value)
+        value = redirect_mod.decide_page_exists_value(status_code, scope_value, status_value, url_matches_value)
         row["Page Exists?"] = value
         pasteable_values.append(value)
 
@@ -77,54 +78,80 @@ def run_checks(rows: List[Dict[str, str]], concurrency: int, timeout: float, use
 def main() -> None:
     st.set_page_config(page_title="Redirect Checker", page_icon="✅", layout="wide")
     st.title("Redirect Checker")
-    st.caption("Upload a CSV, check staging links, and download the updated file.")
+    st.caption("Generate a CSV from a sitemap or upload one to check.")
+    generate_tab, check_tab = st.tabs(["Generate", "Check"]) 
 
     with st.sidebar:
-        st.header("Settings")
+        st.header("Check Settings")
         concurrency = st.slider("Concurrency", min_value=1, max_value=64, value=20)
         timeout = st.number_input("Timeout (seconds)", min_value=1.0, max_value=60.0, value=10.0, step=1.0)
         user_agent = st.text_input("User-Agent", value=redirect_mod.DEFAULT_USER_AGENT)
 
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    # Generate tab
+    with generate_tab:
+        st.subheader("Generate CSV from Sitemap")
+        site = st.text_input("Site root or sitemap.xml", placeholder="https://www.example.com")
+        staging = st.text_input("Staging base host", value="staging-fringe.webflow.io")
+        do_precheck = st.checkbox("Pre-check live and staging availability", value=True)
+        if st.button("Fetch Sitemap and Generate"):
+            if not site or not staging:
+                st.error("Please provide both Site and Staging base host.")
+            else:
+                rows, fieldnames = redirect_mod.generate_rows_from_sitemap(
+                    site_or_sitemap=site,
+                    staging_base_host=staging,
+                    precheck=do_precheck,
+                )
+                if not rows:
+                    st.warning("No URLs found in sitemap.")
+                else:
+                    st.success(f"Found {len(rows)} URLs")
+                    edited = st.data_editor(rows, use_container_width=True, num_rows="dynamic")
+                    csv_bytes = write_csv_to_bytes(fieldnames, edited)
+                    ts = time.strftime("%Y%m%d-%H%M%S")
+                    base = "sitemap"
+                    out_name = f"{base}-generated-{ts}.csv"
+                    st.download_button("Download CSV", data=csv_bytes, file_name=out_name, mime="text/csv")
 
-    if not uploaded:
-        st.info("Select a CSV with columns: 'Theoretical Staging Link', 'Page Exists?', 'Scope', 'Status'.")
-        return
-
-    rows, fieldnames = read_csv_from_bytes(uploaded.read())
-    if not rows:
-        st.warning("No rows detected in the uploaded CSV.")
-        return
-
-    missing = [c for c in ("Theoretical Staging Link", "Page Exists?", "Scope", "Status") if c not in (fieldnames or [])]
-    if missing:
-        st.error("Missing required column(s): " + ", ".join(missing))
-        return
-
-    st.write(f"Rows detected: {len(rows)}")
-    if st.button("Run Checks", type="primary"):
-        start = time.time()
-        updated_rows, pasteable_values = run_checks(rows, concurrency, float(timeout), user_agent)
-        elapsed = time.time() - start
-
-        st.success(f"Done in {elapsed:.1f}s")
-
-        csv_bytes = write_csv_to_bytes(fieldnames, updated_rows)
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        base = os.path.splitext(uploaded.name)[0]
-        out_name = f"{base}-checked-{ts}.csv"
-        st.download_button("Download Updated CSV", data=csv_bytes, file_name=out_name, mime="text/csv")
-
-        st.subheader("Pasteable 'Page Exists?' column")
-        st.caption("Copy all and paste into your Google Sheet column")
-        paste_text = "\n".join(pasteable_values)
-        st.text_area(label="Values", value=paste_text, height=200)
-        st.download_button(
-            "Download Pasteable Text",
-            data=paste_text.encode("utf-8"),
-            file_name=f"{base}-page-exists-{ts}.txt",
-            mime="text/plain",
-        )
+    # Check tab 
+    with check_tab:
+        st.subheader("Upload and Check CSV")
+        uploaded = st.file_uploader("Upload CSV", type=["csv"], key="uploader-check")
+        if not uploaded:
+            st.info("CSV must include columns: 'Theoretical Staging Link', 'Page Exists?', 'URL Matches', 'Scope', 'Status'.")
+            return
+        rows, fieldnames = read_csv_from_bytes(uploaded.read())
+        if not rows:
+            st.warning("No rows detected in the uploaded CSV.")
+            return
+        missing = [
+            c for c in ("Theoretical Staging Link", "Page Exists?", "URL Matches", "Scope", "Status")
+            if c not in (fieldnames or [])
+        ]
+        if missing:
+            st.error("Missing required column(s): " + ", ".join(missing))
+            return
+        st.write(f"Rows detected: {len(rows)}")
+        if st.button("Run Checks", type="primary"):
+            start = time.time()
+            updated_rows, pasteable_values = run_checks(rows, concurrency, float(timeout), user_agent)
+            elapsed = time.time() - start
+            st.success(f"Done in {elapsed:.1f}s")
+            csv_bytes = write_csv_to_bytes(fieldnames, updated_rows)
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            base = os.path.splitext(uploaded.name)[0]
+            out_name = f"{base}-checked-{ts}.csv"
+            st.download_button("Download Updated CSV", data=csv_bytes, file_name=out_name, mime="text/csv")
+            st.subheader("Pasteable 'Page Exists?' column")
+            st.caption("Copy all and paste into your Google Sheet column")
+            paste_text = "\n".join(pasteable_values)
+            st.text_area(label="Values", value=paste_text, height=200)
+            st.download_button(
+                "Download Pasteable Text",
+                data=paste_text.encode("utf-8"),
+                file_name=f"{base}-page-exists-{ts}.txt",
+                mime="text/plain",
+            )
 
 
 if __name__ == "__main__":
